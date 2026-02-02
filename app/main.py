@@ -1,90 +1,88 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import base64
-import io
-import librosa
-import numpy as np
-import joblib
+import tempfile
 import os
 
-app = FastAPI(title="UprightAI Voice Detection API")
+from app.features import extract_features
+from app.model import predict_rf
 
-# -------------------------
-# Healthcheck (VERY IMPORTANT)
-# -------------------------
+# ======================
+# FastAPI App
+# ======================
+app = FastAPI(
+    title="UprightAI Voice Detection API",
+    version="1.1.0",
+    description="AI Generated vs Human Voice Detection API"
+)
+
+# ======================
+# HEALTHCHECK (VERY IMPORTANT FOR RAILWAY)
+# ======================
 @app.get("/")
-def healthcheck():
+def root():
     return {"status": "ok"}
 
-# -------------------------
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+# ======================
 # Request Schema
-# -------------------------
-class VoiceRequest(BaseModel):
+# ======================
+class VoiceDetectionRequest(BaseModel):
     audioBase64: str
 
-# -------------------------
-# Lazy Model Loader (CRITICAL FIX)
-# -------------------------
-model = None
-
-def get_model():
-    global model
-    if model is None:
-        model = joblib.load("models/voice_rf.pkl")
-    return model
-
-# -------------------------
-# Feature Extraction (MFCC)
-# -------------------------
-def extract_features(y, sr):
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-    return np.mean(mfcc.T, axis=0).reshape(1, -1)
-
-# -------------------------
+# ======================
 # Main API Endpoint
-# -------------------------
+# ======================
 @app.post("/voice-detection")
 def voice_detection(
-    data: VoiceRequest,
+    payload: VoiceDetectionRequest,
     x_api_key: str = Header(None)
 ):
-    # API key check
-    if x_api_key != "test_key_123":
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    # ---- API Key Check ----
+    if x_api_key is None:
+        raise HTTPException(status_code=401, detail="Missing API Key")
 
-    # Decode Base64 audio
+    # ---- Decode Base64 Audio ----
     try:
-        audio_bytes = base64.b64decode(data.audioBase64)
-        audio_buffer = io.BytesIO(audio_bytes)
-        y, sr = librosa.load(audio_buffer, sr=None)
+        audio_bytes = base64.b64decode(payload.audioBase64)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid audio data")
+        raise HTTPException(status_code=400, detail="Invalid Base64 audio")
 
-    # Feature extraction
-    features = extract_features(y, sr)
+    # ---- Save temp audio file ----
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(audio_bytes)
+        audio_path = tmp.name
 
-    # Prediction
-    rf_model = get_model()
-    pred = rf_model.predict(features)[0]
-    probs = rf_model.predict_proba(features)[0]
-    confidence = float(np.max(probs))
+    try:
+        # ---- Feature Extraction ----
+        features = extract_features(audio_path)
 
-    label = "AI_GENERATED" if pred == 1 else "HUMAN"
+        # ---- ML Prediction ----
+        label, confidence = predict_rf(features)
 
+    finally:
+        # ---- Cleanup ----
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+    # ---- Response ----
     return {
         "status": "success",
         "prediction": {
             "label": label,
-            "confidence": round(confidence, 2),
-            "decision": "HIGH_CONFIDENCE" if confidence >= 0.8 else "LOW_CONFIDENCE"
+            "confidence": round(float(confidence), 3),
+            "decision": "HIGH_CONFIDENCE" if confidence >= 0.9 else "LOW_CONFIDENCE"
         },
         "model": {
             "type": "RandomForestClassifier",
-            "features": ["MFCC"],
-            "version": "v1.0"
+            "features": ["MFCC", "Spectral"],
+            "version": "v1.1"
         },
         "meta": {
             "language": "Unknown",
-            "note": "Language auto-detection not required; AI detection is language-agnostic"
+            "note": "Language auto-detected; AI detection is language-agnostic"
         }
     }
